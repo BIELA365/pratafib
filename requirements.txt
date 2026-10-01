@@ -1,0 +1,25 @@
+# Dependensi Python — Pipeline Pelatihan Model 1D-TA-DSC
+# Instalasi: pip install -r requirements.txt
+
+# ==========================================
+# Core Deep Learning
+# ==========================================
+tensorflow>=2.13.0,<2.18.0    # Keras built-in + TFLite converter
+numpy>=1.24.0
+scipy>=1.11.0
+
+# ==========================================
+# Pembacaan Dataset MIMIC-III (format WFDB)
+# ==========================================
+wfdb>=4.1.0                   # Library PhysioNet untuk baca .hea + .dat
+
+# ==========================================
+# Pemrosesan Sinyal
+# ==========================================
+scikit-learn>=1.3.0           # Train/test split, metrik evaluasi
+matplotlib>=3.7.0             # Visualisasi sinyal & kurva pelatihan
+
+# ==========================================
+# Utilitas
+# ==========================================
+tqdm>=4.65.0                  # Progress bar saat preprocessing
