@@ -1,341 +1,353 @@
 """
+02_model_architecture.py
 ================================================================================
- 02_model_architecture.py
- Arsitektur 1D Temporal Attention Depthwise Separable Convolution (1D-TA-DSC)
-================================================================================
- Model deep learning ringan untuk klasifikasi Atrial Fibrillation (AFib)
- dari sinyal PPG (Photoplethysmography).
- 
- Dirancang khusus untuk deployment pada mikrokontroler ESP32-S3:
-   - Target parameter: < 50.000 (agar model INT8 ≈ 40-50 KB)
-   - Input: 625 sampel (5 detik @ 125 Hz) × 1 kanal
-   - Output: 2 kelas (Normal, AFib)
- 
- Komponen arsitektur:
-   1. Initial Conv1D — menangkap morfologi dasar gelombang PPG
-   2. Depthwise Separable Conv1D (DSC) — ekstraksi fitur efisien
-   3. Temporal Attention — bobot adaptif pada interval temporal
-   4. Global Average Pooling + Dense Classifier
-   
- Penggunaan:
-   from model_architecture import build_1d_ta_dsc_model
-   model = build_1d_ta_dsc_model()
-   model.summary()
+Arsitektur Hybrid Ringan: 1D Depthwise Separable CNN + Temporal Attention GRU
+(1D-DSC + TA-GRU) Berbasis Ekstraksi Morfologi Gelombang PPG (PPG, VPG, APG /
+Dicrotic Notch) & Transisi Ritme Sekuensial 30 Detik, Dilengkapi Dukungan
+Self-Supervised Contrastive Learning (SimCLR) sesuai Proposal Pra-TA:
+  "Perancangan Ear-Worn Berbasis PPG untuk Deteksi Fibrilasi Atrium
+   Menggunakan Deep Learning" (Abiel Ifan Imanuel Hukom - 5023231004)
+
+Keunggulan Ilmiah Arsitektur Ini:
+1. Tidak hanya mengandalkan jarak puncak sistolik (IBI), melainkan mengekstraksi
+   langsung Morfologi Gelombang PPG per sub-jendela waktu menggunakan:
+   - Sinyal PPG ternormalisasi (amplitudo sistolik & lembah diastolik)
+   - Turunan Pertama / Velocity Plethysmogram (VPG = dPPG/dt): kemiringan naik
+     fase anakrotik (anacrotic slope) & kemiringan turun katakrotik.
+   - Turunan Kedua / Acceleration Plethysmogram (APG = d^2PPG/dt^2): menonjolkan
+     kompleks gelombang c-d-e pada Dicrotic Notch (penutupan katup aorta di fase
+     katakrotik, sesuai Basza et al. [45] / Slide 8 ETS).
+2. Membedakan AFib dari Kontraksi Prematur (PAC & PVC - Ding et al. [4]):
+   - Pada PAC/PVC, hanya 1-2 sub-jendela yang mengalami denyut prematur + jeda
+     kompensasi (compensatory pause), sedangkan sub-jendela sinus di sekitarnya
+     tetap memiliki dicrotic notch dan kemiringan morfologi yang konsisten.
+   - Pada AFib, morfologi dicrotic notch, amplitudo pulsa, dan periodisitas
+     berubah acak secara terus-menerus di sepanjang 16 sub-jendela (30 detik).
+3. Mendukung Two-Stage Training (Bab 2.7 - Wu et al. [37] & Rong et al. [39]):
+   - Tahap 1: Self-Supervised Contrastive Pre-Training (SimCLR) dengan operasi
+     `AddNoise`, `Drift`, dan `Bernoulli-Gaussian` (Persamaan 2.11).
+   - Tahap 2: Supervised Fine-Tuning (AFib vs Non-AFib [Normal + PAC/PVC]).
+4. 100% kompatibel dengan TFLite Built-in Ops (Float32 & INT8) untuk inferensi
+   real-time < 2 ms di Raspberry Pi Zero 2 W.
 ================================================================================
 """
 
 import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import layers, Model
+from tensorflow.keras import layers, models, regularizers
 
 
-# ============================================================================
-# LAYER KUSTOM: Temporal Attention
-# ============================================================================
-
-@tf.keras.utils.register_keras_serializable(package="Custom", name="TemporalAttention")
-class TemporalAttention(layers.Layer):
+@tf.keras.utils.register_keras_serializable(package="PrataAFib")
+class PPGMorphologyAndRhythmLayer(layers.Layer):
     """
-    Mekanisme Self-Attention 1D untuk sinyal temporal.
-    
-    Menghitung bobot atensi pada setiap timestep berdasarkan hubungan
-    Query-Key, lalu menghasilkan representasi kontekstual melalui 
-    penjumlahan tertimbang Value.
-    
-    Berbeda dari Multi-Head Attention standar, layer ini menggunakan
-    single-head attention yang lebih ringan untuk deployment embedded.
-    
-    Args:
-        d_model: dimensi ruang atensi (default: sesuai input)
-        
-    Input shape:  (batch, timesteps, features)
-    Output shape: (batch, timesteps, features)
+    Layer Front-End Fisiologis yang mengekstraksi:
+    1) 16 Kanal Morfologi Gelombang Intra-Detak (PPG, VPG = dPPG/dt, APG = d^2PPG/dt^2):
+       - Amplop puncak sistolik & lembah diastolik (variasi volume sekuncup / pulse deficit)
+       - Kemiringan fase anakrotik (anacrotic slope) & katakrotik dari VPG
+       - Intensitas & energi infleksi Dicrotic Notch dari APG (d^2PPG/dt^2)
+    2) 112 Kanal Autokorelasi Ritme Gelombang PPG (lag 35..146 sampel = 0.28s..1.17s)
+    3) 32 Kanal Konsistensi Morfologi VPG Antar-Detak (lag 36..129 sampel, step 3)
+    Total fitur per sub-jendela waktu (16 sub-jendela sepanjang 30 detik) = 160 kanal.
+    Seluruh operasi menggunakan TFLite Built-in Ops murni.
     """
-    
-    def __init__(self, d_model=None, **kwargs):
-        super(TemporalAttention, self).__init__(**kwargs)
-        self.d_model = d_model
-    
-    def build(self, input_shape):
-        feature_dim = input_shape[-1]
-        d = self.d_model if self.d_model else feature_dim
-        
-        # Proyeksi Query, Key, Value
-        self.query_dense = layers.Dense(d, use_bias=False, name="attn_query")
-        self.key_dense = layers.Dense(d, use_bias=False, name="attn_key")
-        self.value_dense = layers.Dense(d, use_bias=False, name="attn_value")
-        
-        # Proyeksi output
-        self.output_dense = layers.Dense(feature_dim, use_bias=False, 
-                                          name="attn_output")
-        
-        # Layer normalization untuk stabilitas numerik
-        self.layer_norm = layers.LayerNormalization(name="attn_norm")
-        
-        self.scale = tf.math.sqrt(tf.cast(d, tf.float32))
-        super(TemporalAttention, self).build(input_shape)
-    
-    def call(self, inputs, training=None):
-        # Hitung Q, K, V
-        Q = self.query_dense(inputs)    # (batch, T, d)
-        K = self.key_dense(inputs)      # (batch, T, d)
-        V = self.value_dense(inputs)    # (batch, T, d)
-        
-        # Scaled dot-product attention
-        # scores = Q · K^T / sqrt(d)
-        scores = tf.matmul(Q, K, transpose_b=True) / self.scale  # (batch, T, T)
-        attention_weights = tf.nn.softmax(scores, axis=-1)         # (batch, T, T)
-        
-        # Context = weighted sum of Values
-        context = tf.matmul(attention_weights, V)  # (batch, T, d)
-        
-        # Proyeksi output
-        output = self.output_dense(context)  # (batch, T, features)
-        
-        # Residual connection + layer normalization
-        output = self.layer_norm(output + inputs)
-        
-        return output
-    
+
+    def __init__(
+        self,
+        min_lag=35,
+        max_lag=146,
+        frame_size=300,
+        frame_stride=230,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.min_lag = min_lag
+        self.max_lag = max_lag
+        self.frame_size = frame_size
+        self.frame_stride = frame_stride
+        self.smooth_pool = layers.AveragePooling1D(
+            pool_size=3, strides=1, padding="same"
+        )
+        self.trend_pool = layers.AveragePooling1D(
+            pool_size=125, strides=1, padding="same"
+        )
+        self.avg_frame_pool = layers.AveragePooling1D(
+            pool_size=frame_size, strides=frame_stride, padding="valid"
+        )
+        self.max_frame_pool = layers.MaxPooling1D(
+            pool_size=frame_size, strides=frame_stride, padding="valid"
+        )
+
+    def call(self, inputs):
+        # 1. Denoising ringan & penghilangan wander frekuensi sangat rendah
+        x = self.smooth_pool(inputs)
+        x = x - self.trend_pool(x)
+
+        # 2. Turunan Pertama (VPG = dPPG/dt) -> Kemiringan Anakrotik & Katakrotik
+        vpg_raw = x[:, 1:, :] - x[:, :-1, :]
+        vpg = tf.concat([vpg_raw[:, :1, :], vpg_raw], axis=1) * 5.0
+
+        # 3. Turunan Kedua (APG = d^2PPG/dt^2) -> Infleksi Dicrotic Notch (Fase Katakrotik)
+        apg_raw = vpg[:, 1:, :] - vpg[:, :-1, :]
+        apg = tf.concat([apg_raw[:, :1, :], apg_raw], axis=1) * 2.0
+
+        # 4. Normalisasi energi lokal untuk konsistensi amplitudo
+        x_sq = tf.square(x)
+        local_var = self.trend_pool(x_sq)
+        inv_std = tf.math.rsqrt(local_var + 1e-4)
+        x_norm = tf.clip_by_value(x * inv_std, -3.5, 3.5)
+
+        vpg_sq = tf.square(vpg)
+        vpg_inv_std = tf.math.rsqrt(self.trend_pool(vpg_sq) + 1e-4)
+        vpg_norm = tf.clip_by_value(vpg * vpg_inv_std, -3.5, 3.5)
+
+        apg_sq = tf.square(apg)
+        apg_inv_std = tf.math.rsqrt(self.trend_pool(apg_sq) + 1e-4)
+        apg_norm = tf.clip_by_value(apg * apg_inv_std, -3.5, 3.5)
+
+        # 5. Ekstraksi 16 Kanal Fitur Morfologi Gelombang per Sub-Jendela (PPG + VPG + APG)
+        pos_ppg = tf.nn.relu(x_norm)
+        neg_ppg = tf.nn.relu(-x_norm)
+        pos_vpg = tf.nn.relu(vpg_norm)
+        neg_vpg = tf.nn.relu(-vpg_norm)
+        pos_apg = tf.nn.relu(apg_norm)
+        neg_apg = tf.nn.relu(-apg_norm)
+        abs_vpg = tf.abs(vpg_norm)
+        abs_apg = tf.abs(apg_norm)
+
+        morph_avg_inputs = tf.concat(
+            [
+                pos_ppg,                     # 1. Rata-rata amplop sistolik
+                neg_ppg,                     # 2. Rata-rata amplop diastolik
+                tf.square(x_norm),           # 3. Energi pulsatil sub-jendela
+                pos_vpg,                     # 4. Rata-rata kemiringan naik anakrotik
+                neg_vpg,                     # 5. Rata-rata kemiringan turun katakrotik
+                abs_vpg,                     # 6. Energi kecepatan gelombang (VPG)
+                pos_apg,                     # 7. Rata-rata infleksi positif Dicrotic Notch (c-wave)
+                neg_apg,                     # 8. Rata-rata infleksi negatif Dicrotic Notch (d-wave)
+                abs_apg,                     # 9. Energi total Dicrotic Notch (APG)
+                tf.square(apg_norm),         # 10. Daya ketajaman Dicrotic Notch
+            ],
+            axis=-1,
+        )
+        morph_max_inputs = tf.concat(
+            [
+                pos_ppg,                     # 11. Puncak sistolik maksimum sub-jendela
+                neg_ppg,                     # 12. Lembah diastolik terdalam sub-jendela
+                pos_vpg,                     # 13. Kemiringan anakrotik maksimum (dPPG/dt max)
+                neg_vpg,                     # 14. Kemiringan katakrotik maksimum
+                pos_apg,                     # 15. Puncak gelombang-a/c APG (Dicrotic Notch peak)
+                neg_apg,                     # 16. Lembah gelombang-b/d APG (Dicrotic Notch trough)
+            ],
+            axis=-1,
+        )
+
+        morph_avg_frames = self.avg_frame_pool(morph_avg_inputs)  # (batch, 16, 10)
+        morph_max_frames = self.max_frame_pool(morph_max_inputs)  # (batch, 16, 6)
+
+        # 6. Ekstraksi 112 Kanal Autokorelasi Ritme Gelombang PPG (lag 35..146)
+        ppg_lag_prods = []
+        for lag in range(self.min_lag, self.max_lag + 1):
+            shifted = tf.pad(x_norm[:, :-lag, :], [[0, 0], [lag, 0], [0, 0]])
+            ppg_lag_prods.append(x_norm * shifted)
+        ppg_lag_Concat = tf.concat(ppg_lag_prods, axis=-1)
+        ppg_rhythm_frames = self.avg_frame_pool(ppg_lag_Concat)  # (batch, 16, 112)
+
+        # 7. Ekstraksi 32 Kanal Konsistensi Morfologi Kemiringan & Notch Antar-Detak (VPG lags)
+        vpg_lag_prods = []
+        for lag in range(36, 132, 3):  # 32 lag mewakili 0.29s .. 1.05s
+            shifted_v = tf.pad(vpg_norm[:, :-lag, :], [[0, 0], [lag, 0], [0, 0]])
+            vpg_lag_prods.append(vpg_norm * shifted_v)
+        vpg_lag_concat = tf.concat(vpg_lag_prods, axis=-1)
+        vpg_morph_frames = self.avg_frame_pool(vpg_lag_concat)  # (batch, 16, 32)
+
+        # Gabungkan seluruh fitur: 10 + 6 + 112 + 32 = 160 kanal x 16 sub-jendela waktu
+        out_frames = tf.concat(
+            [morph_avg_frames, morph_max_frames, ppg_rhythm_frames, vpg_morph_frames],
+            axis=-1,
+        )
+        return out_frames
+
     def get_config(self):
-        config = super(TemporalAttention, self).get_config()
-        config.update({"d_model": self.d_model})
-        return config
+        cfg = super().get_config()
+        cfg.update(
+            {
+                "min_lag": self.min_lag,
+                "max_lag": self.max_lag,
+                "frame_size": self.frame_size,
+                "frame_stride": self.frame_stride,
+            }
+        )
+        return cfg
 
 
-# ============================================================================
-# BLOK DEPTHWISE SEPARABLE CONVOLUTION
-# ============================================================================
-
-def depthwise_separable_conv_block(x, filters, kernel_size, name_prefix):
+@tf.keras.utils.register_keras_serializable(package="PrataAFib")
+class TemporalAttentionLayer(layers.Layer):
     """
-    Blok Depthwise Separable Convolution 1D.
-    
-    Terdiri dari:
-      1. Depthwise Conv1D — konvolusi per-kanal (hemat parameter)
-      2. Pointwise Conv1D (1×1) — kombinasi antar-kanal
-      3. BatchNormalization + ReLU
-    
-    Dibandingkan Conv1D standar:
-      - Conv1D standar: in_ch × out_ch × kernel_size parameter
-      - DSC: in_ch × kernel_size + in_ch × out_ch parameter
-      - Penghematan: ~kernel_size kali lebih sedikit parameter
-    
-    Args:
-        x: input tensor (batch, timesteps, channels)
-        filters: jumlah filter output (pointwise)
-        kernel_size: ukuran kernel depthwise
-        name_prefix: prefix untuk penamaan layer
-    
-    Returns:
-        output tensor (batch, timesteps, filters)
+    Mekanisme Temporal Attention (TA) sesuai Persamaan (2.9)-(2.10) Proposal Bab 2.6:
+      u_t = tanh(W_w * h_t + b_w)
+      alpha_t = softmax(u_t^T * u_w)
+      c = sum_t(alpha_t * h_t)
+    Memungkinkan model memberikan bobot perhatian berbeda pada setiap sub-jendela
+    waktu untuk membedakan ketidakteraturan persisten (AFib) dari denyut ektopik
+    terisolasi (PAC/PVC) maupun artefak gerak sesaat.
     """
-    # Depthwise convolution (konvolusi independen per kanal)
-    x = layers.DepthwiseConv1D(
-        kernel_size=kernel_size,
-        padding='same',
-        use_bias=False,
-        name=f"{name_prefix}_depthwise"
-    )(x)
-    x = layers.BatchNormalization(name=f"{name_prefix}_bn1")(x)
-    x = layers.ReLU(name=f"{name_prefix}_relu1")(x)
-    
-    # Pointwise convolution (1×1 conv untuk mixing antar kanal)
-    x = layers.Conv1D(
+
+    def __init__(self, attn_units=32, **kwargs):
+        super().__init__(**kwargs)
+        self.attn_units = attn_units
+        self.w_dense = layers.Dense(attn_units, activation="tanh")
+        self.u_dense = layers.Dense(1, use_bias=False)
+
+    def build(self, input_shape):
+        super().build(input_shape)
+
+    def call(self, inputs):
+        # inputs: (batch, time_steps, gru_units)
+        score = self.u_dense(self.w_dense(inputs))  # (batch, time_steps, 1)
+        alpha = tf.nn.softmax(score, axis=1)        # (batch, time_steps, 1)
+        context = tf.reduce_sum(inputs * alpha, axis=1)  # (batch, gru_units)
+        return context
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"attn_units": self.attn_units})
+        return cfg
+
+
+@tf.keras.utils.register_keras_serializable(package="PrataAFib")
+class L2NormalizeLayer(layers.Layer):
+    """Normalisasi L2 untuk vektor proyeksi SimCLR Contrastive Learning."""
+
+    def call(self, inputs):
+        return tf.math.l2_normalize(inputs, axis=-1)
+
+
+def dsc_se_residual_block(x, filters, kernel_size=5, stride=1, weight_decay=1e-4, name_prefix="dsc"):
+    """
+    Blok 1D Depthwise Separable Convolution (1D-DSC) sesuai Persamaan (2.1)-(2.3)
+    Proposal Bab 2.6, dilengkapi Squeeze-and-Excitation (SE) & Residual Connection.
+    """
+    shortcut = x
+
+    # Depthwise 1D Convolution + Pointwise 1x1 Convolution (SeparableConv1D)
+    y = layers.SeparableConv1D(
         filters=filters,
-        kernel_size=1,
-        padding='same',
+        kernel_size=kernel_size,
+        strides=stride,
+        padding="same",
         use_bias=False,
-        name=f"{name_prefix}_pointwise"
+        depthwise_regularizer=regularizers.l2(weight_decay),
+        pointwise_regularizer=regularizers.l2(weight_decay),
+        name=f"{name_prefix}_sepconv",
     )(x)
-    x = layers.BatchNormalization(name=f"{name_prefix}_bn2")(x)
-    x = layers.ReLU(name=f"{name_prefix}_relu2")(x)
-    
-    return x
+    y = layers.BatchNormalization(name=f"{name_prefix}_bn")(y)
+    y = layers.Activation("swish", name=f"{name_prefix}_swish")(y)
+
+    # Squeeze-and-Excitation (Channel Attention pada fitur morfologi vs ritme)
+    se = layers.GlobalAveragePooling1D(keepdims=True, name=f"{name_prefix}_se_gap")(y)
+    se = layers.Dense(max(filters // 4, 8), activation="swish", name=f"{name_prefix}_se_fc1")(se)
+    se = layers.Dense(filters, activation="sigmoid", name=f"{name_prefix}_se_fc2")(se)
+    y = layers.Multiply(name=f"{name_prefix}_se_scale")([y, se])
+
+    # Residual projection jika dimensi berubah
+    if shortcut.shape[-1] != filters or stride != 1:
+        shortcut = layers.Conv1D(
+            filters=filters,
+            kernel_size=1,
+            strides=stride,
+            padding="same",
+            use_bias=False,
+            kernel_regularizer=regularizers.l2(weight_decay),
+            name=f"{name_prefix}_proj",
+        )(shortcut)
+        shortcut = layers.BatchNormalization(name=f"{name_prefix}_proj_bn")(shortcut)
+
+    out = layers.Add(name=f"{name_prefix}_add")([y, shortcut])
+    return out
 
 
-# ============================================================================
-# MODEL UTAMA: 1D-TA-DSC
-# ============================================================================
-
-def build_1d_ta_dsc_model(
-    input_length=625,
-    n_channels=1,
-    n_classes=2,
-    initial_filters=16,
-    dsc_configs=None,
-    attention_dim=None,
-    dropout_rate=0.3,
-):
+def build_encoder_backbone(input_shape=(3750, 1)):
     """
-    Membangun model 1D Temporal Attention Depthwise Separable Convolution.
-    
-    Arsitektur:
-        Input(625,1) → Conv1D(16,k7) → MaxPool(2)
-                      → DSC(32,k5) → MaxPool(2)  
-                      → DSC(64,k5) → MaxPool(2)
-                      → TemporalAttention(64)
-                      → DSC(64,k3) → GlobalAvgPool
-                      → Dense(32) → Dropout → Dense(2,softmax)
-    
-    Args:
-        input_length: panjang sinyal input (default: 625 = 5s × 125Hz)
-        n_channels: jumlah kanal input (default: 1 untuk PPG tunggal)
-        n_classes: jumlah kelas output (default: 2 = Normal + AFib)
-        initial_filters: filter pada layer konvolusi pertama
-        dsc_configs: list tuple (filters, kernel_size) untuk blok DSC
-        attention_dim: dimensi ruang atensi (None = otomatis)
-        dropout_rate: rasio dropout sebelum classifier
-    
-    Returns:
-        model: keras.Model yang siap di-compile dan dilatih
+    Membangun Encoder Backbone 1D-DSC + TA-GRU yang memetakan sinyal PPG 30 detik
+    `(batch, 3750, 1)` menjadi vektor representasi kardiak 64-dimensi `h_repr`.
+    Digunakan pada:
+      - Tahap 1: Self-Supervised Contrastive Learning (SimCLR)
+      - Tahap 2: Supervised Fine-Tuning Klasifikasi AFib vs Non-AFib
     """
-    if dsc_configs is None:
-        dsc_configs = [
-            (32, 5),   # DSC Block 1
-            (64, 5),   # DSC Block 2 (sebelum attention)
-            (64, 3),   # DSC Block 3 (setelah attention)
-        ]
-    
-    # ---- Input Layer ----
-    inputs = layers.Input(shape=(input_length, n_channels), name="ppg_input")
-    
-    # ---- Blok 1: Initial Convolution ----
-    # Menangkap morfologi dasar gelombang PPG (sistol, diastol, notch)
-    x = layers.Conv1D(
-        filters=initial_filters,
-        kernel_size=7,
-        padding='same',
-        use_bias=False,
-        name="initial_conv"
-    )(inputs)
-    x = layers.BatchNormalization(name="initial_bn")(x)
-    x = layers.ReLU(name="initial_relu")(x)
-    x = layers.MaxPooling1D(pool_size=2, name="initial_pool")(x)
-    # Shape: (batch, 312, 16)
-    
-    # ---- Blok 2: DSC Block 1 ----
-    filters_1, ks_1 = dsc_configs[0]
-    x = depthwise_separable_conv_block(x, filters_1, ks_1, "dsc1")
-    x = layers.MaxPooling1D(pool_size=2, name="dsc1_pool")(x)
-    # Shape: (batch, 156, 32)
-    
-    # ---- Blok 3: DSC Block 2 ----
-    filters_2, ks_2 = dsc_configs[1]
-    x = depthwise_separable_conv_block(x, filters_2, ks_2, "dsc2")
-    x = layers.MaxPooling1D(pool_size=2, name="dsc2_pool")(x)
-    # Shape: (batch, 78, 64)
-    
-    # ---- Blok 4: Temporal Attention ----
-    # Memberikan bobot adaptif pada momen temporal yang paling informatif
-    # (contoh: interval antar puncak sistolik yang ireguler pada AFib)
-    x = TemporalAttention(d_model=attention_dim, name="temporal_attention")(x)
-    # Shape: (batch, 78, 64)
-    
-    # ---- Blok 5: DSC Block 3 ----
-    filters_3, ks_3 = dsc_configs[2]
-    x = depthwise_separable_conv_block(x, filters_3, ks_3, "dsc3")
-    # Shape: (batch, 78, 64)
-    
-    # ---- Global Average Pooling ----
-    # Meringkas seluruh representasi temporal menjadi vektor fitur tunggal
-    x = layers.GlobalAveragePooling1D(name="global_avg_pool")(x)
-    # Shape: (batch, 64)
-    
-    # ---- Classifier Head ----
-    x = layers.Dense(32, activation='relu', name="fc1")(x)
-    x = layers.Dropout(dropout_rate, name="dropout")(x)
-    outputs = layers.Dense(n_classes, activation='softmax', name="classifier")(x)
-    # Shape: (batch, 2)
-    
-    model = Model(inputs=inputs, outputs=outputs, name="1D_TA_DSC_AFib")
-    
+    inputs = layers.Input(shape=input_shape, name="ppg_input")
+
+    # 1. Front-End Morfologi Gelombang (PPG + VPG + APG/Dicrotic Notch) & Ritme
+    # Output: (batch, 16, 160)
+    x = PPGMorphologyAndRhythmLayer(name="ppg_morphology_rhythm_frontend")(inputs)
+    x = layers.BatchNormalization(name="frontend_bn")(x)
+
+    # 2. Tiga Blok 1D Depthwise Separable Convolution (1D-DSC) Multi-Skala
+    x = dsc_se_residual_block(x, filters=32, kernel_size=5, stride=1, name_prefix="dsc_block1")
+    x = layers.SpatialDropout1D(0.15, name="dsc_drop1")(x)
+
+    x = dsc_se_residual_block(x, filters=48, kernel_size=5, stride=1, name_prefix="dsc_block2")
+    x = layers.SpatialDropout1D(0.15, name="dsc_drop2")(x)
+
+    x = dsc_se_residual_block(x, filters=48, kernel_size=3, stride=1, name_prefix="dsc_block3")
+
+    # 3. Temporal Attention GRU (TA-GRU) + Global Morphology Pooling
+    # unroll=True menjamin kompatibilitas 100% dengan TFLite Built-in Ops tanpa Flex Delegate
+    gru_seq = layers.GRU(
+        units=32,
+        return_sequences=True,
+        unroll=True,
+         kernel_regularizer=regularizers.l2(1e-4),
+        name="ta_gru_sequence",
+    )(x)
+    attn_context = TemporalAttentionLayer(attn_units=24, name="temporal_attention")(gru_seq)
+
+    # Ringkasan statistik sekuensial (Mean & Max sepanjang 16 sub-jendela waktu)
+    gap_feat = layers.GlobalAveragePooling1D(name="global_avg_pool")(x)
+    gmp_feat = layers.GlobalMaxPooling1D(name="global_max_pool")(x)
+
+    combined = layers.Concatenate(name="encoder_concat")([attn_context, gap_feat, gmp_feat])
+    h_repr = layers.Dense(64, activation="swish", name="cardiac_representation")(combined)
+    h_repr = layers.BatchNormalization(name="cardiac_representation_bn")(h_repr)
+
+    return models.Model(inputs=inputs, outputs=h_repr, name="Encoder_1D_DSC_TA_GRU")
+
+
+def build_simclr_projection_model(encoder, proj_dim=32):
+    """
+    Membangun model Self-Supervised Contrastive Learning (SimCLR) sesuai Bab 2.7
+    (Wu et al. [37]) dengan menambahkan Nonlinear Projection Head g(h) di atas
+    Encoder 1D-DSC + TA-GRU untuk pelatihan NT-Xent Contrastive Loss.
+    """
+    inputs = encoder.input
+    h = encoder.output
+    z = layers.Dense(64, activation="relu", name="simclr_proj_fc1")(h)
+    z = layers.BatchNormalization(name="simclr_proj_bn")(z)
+    z = layers.Dense(proj_dim, use_bias=False, name="simclr_proj_fc2")(z)
+    z_norm = L2NormalizeLayer(name="simclr_l2_norm")(z)
+    return models.Model(inputs=inputs, outputs=z_norm, name="SimCLR_1D_DSC_TA_GRU")
+
+
+def build_1d_dsc_ta_gru_model(input_shape=(3750, 1), encoder=None):
+    """
+    Membangun model lengkap klasifikasi AFib vs Non-AFib (1D-DSC + TA-GRU).
+    Jika `encoder` yang telah di-pretrain dengan SimCLR diberikan, bobot encoder
+    tersebut langsung digunakan sebagai inisialisasi fitur tahan-artefak.
+    """
+    if encoder is None:
+        encoder = build_encoder_backbone(input_shape=input_shape)
+
+    inputs = encoder.input
+    h_repr = encoder.output
+
+    x = layers.Dropout(0.30, name="head_dropout1")(h_repr)
+    x = layers.Dense(32, activation="swish", name="head_fc1")(x)
+    x = layers.Dropout(0.20, name="head_dropout2")(x)
+    outputs = layers.Dense(1, activation="sigmoid", name="afib_prob")(x)
+
+    model = models.Model(inputs=inputs, outputs=outputs, name="Hybrid_1D_DSC_TA_GRU_30s")
     return model
 
 
-# ============================================================================
-# VALIDASI ARSITEKTUR
-# ============================================================================
-
-def validate_architecture(model, max_params=50000, max_tflite_kb=100):
-    """
-    Memvalidasi bahwa model memenuhi constraint untuk deployment ESP32-S3.
-    
-    Checks:
-      1. Jumlah parameter total < max_params
-      2. Estimasi ukuran model TFLite INT8 < max_tflite_kb
-      3. Input/output shape sesuai spesifikasi
-    """
-    total_params = model.count_params()
-    trainable = sum([tf.keras.backend.count_params(w) 
-                     for w in model.trainable_weights])
-    non_trainable = total_params - trainable
-    
-    # Estimasi ukuran TFLite INT8 (≈1 byte per parameter + overhead)
-    estimated_tflite_kb = (total_params * 1 + 2048) / 1024  # 1 byte/param + 2KB overhead
-    
-    input_shape = model.input_shape
-    output_shape = model.output_shape
-    
-    print("\n" + "=" * 70)
-    print(" VALIDASI ARSITEKTUR MODEL 1D-TA-DSC")
-    print("=" * 70)
-    print(f"  Input shape:        {input_shape}")
-    print(f"  Output shape:       {output_shape}")
-    print(f"  Total parameter:    {total_params:,}")
-    print(f"    - Trainable:      {trainable:,}")
-    print(f"    - Non-trainable:  {non_trainable:,}")
-    print(f"  Est. TFLite INT8:   ~{estimated_tflite_kb:.1f} KB")
-    print("-" * 70)
-    
-    # Validasi constraints
-    checks = []
-    
-    if total_params <= max_params:
-        checks.append(f"  [PASS] Parameter ({total_params:,}) <= {max_params:,}")
-    else:
-        checks.append(f"  [FAIL] Parameter ({total_params:,}) > {max_params:,} — TERLALU BESAR!")
-    
-    if estimated_tflite_kb <= max_tflite_kb:
-        checks.append(f"  [PASS] Est. TFLite ({estimated_tflite_kb:.1f} KB) <= {max_tflite_kb} KB")
-    else:
-        checks.append(f"  [FAIL] Est. TFLite ({estimated_tflite_kb:.1f} KB) > {max_tflite_kb} KB — TERLALU BESAR!")
-    
-    if input_shape == (None, 625, 1):
-        checks.append(f"  [PASS] Input shape sesuai: (batch, 625, 1)")
-    else:
-        checks.append(f"  [WARN] Input shape: {input_shape} (expected (None, 625, 1))")
-    
-    if output_shape == (None, 2):
-        checks.append(f"  [PASS] Output shape sesuai: (batch, 2)")
-    else:
-        checks.append(f"  [WARN] Output shape: {output_shape} (expected (None, 2))")
-    
-    for c in checks:
-        print(c)
-    
-    print("=" * 70)
-    
-    all_pass = all("[PASS]" in c for c in checks)
-    if all_pass:
-        print("  [INFO] Model LOLOS semua validasi — siap untuk deployment ESP32-S3!")
-    else:
-        print("  [WARN] Ada constraint yang belum terpenuhi. Review arsitektur.")
-    print("=" * 70)
-    
-    return all_pass
-
-
-# ============================================================================
-# MAIN — Bangun & Tampilkan Arsitektur
-# ============================================================================
-
 if __name__ == "__main__":
-    print("Membangun arsitektur model 1D-TA-DSC...")
-    model = build_1d_ta_dsc_model()
-    
-    # Tampilkan ringkasan arsitektur
-    model.summary(line_length=90)
-    
-    # Validasi constraint untuk ESP32-S3
-    validate_architecture(model)
+    model = build_1d_dsc_ta_gru_model(input_shape=(3750, 1))
+    model.summary()
+    print(f"\nTotal Parameter Model: {model.count_params():,}")

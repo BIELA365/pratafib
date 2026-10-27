@@ -1,0 +1,28 @@
+{
+  "window_seconds": 30,
+  "sampling_rate_hz": 125,
+  "window_samples": 3750,
+  "total_segments": 14596,
+  "total_subjects": 86,
+  "test_segments": 2458,
+  "test_subjects": 12,
+  "simclr_contrastive_loss_start": 2.3329516839580378,
+  "simclr_contrastive_loss_end": 0.4097449591680735,
+  "accuracy": 0.9589096826688365,
+  "sensitivity": 0.94,
+  "specificity": 0.9801381692488763,
+  "specificity_pure_normal": 0.9939024390243902,
+  "specificity_pac_pvc_ectopic": 0.9467455621301775,
+  "precision": 0.9815261044176706,
+  "f1_score": 0.9603143418467583,
+  "roc_auc": 0.9928743191178424,
+  "noisy_test_accuracy": 0.9650122050447518,
+  "noisy_test_f1_score": 0.9664586583463338,
+  "noisy_test_roc_auc": 0.9935738009831274,
+  "confusion_matrix": {
+    "tn": 1135,
+    "fp": 23,
+    "fn": 78,
+    "tp": 1222
+  }
+}

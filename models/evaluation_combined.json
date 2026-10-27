@@ -1,42 +1,47 @@
 {
-  "accuracy": 0.32340815391662847,
-  "f1_macro": 0.3125784445847306,
-  "auc_roc": 0.23734924366312346,
+  "architecture": "1D-DSC + TA-GRU (1D-TA-DSC)",
+  "target_device": "Raspberry Pi Zero 2 W",
+  "decision_threshold": 0.5,
+  "accuracy": 0.997086247086247,
+  "sensitivity_recall_afib": 0.9968085106382979,
+  "specificity_normal": 0.9974226804123711,
+  "f1_macro": 0.997059717547832,
+  "auc_roc": 0.9999465343277034,
   "classification_report": {
     "Normal": {
-      "precision": 0.22760800842992623,
-      "recall": 0.225,
-      "f1-score": 0.22629649030906235,
-      "support": 960.0
+      "precision": 0.9961389961389961,
+      "recall": 0.9974226804123711,
+      "f1-score": 0.9967804249839022,
+      "support": 776.0
     },
     "AFib": {
-      "precision": 0.39708265802269044,
-      "recall": 0.40065412919051513,
-      "f1-score": 0.39886039886039887,
-      "support": 1223.0
+      "precision": 0.9978700745473909,
+      "recall": 0.9968085106382979,
+      "f1-score": 0.9973390101117616,
+      "support": 940.0
     },
-    "accuracy": 0.32340815391662847,
+    "accuracy": 0.997086247086247,
     "macro avg": {
-      "precision": 0.3123453332263083,
-      "recall": 0.31282706459525755,
-      "f1-score": 0.3125784445847306,
-      "support": 2183.0
+      "precision": 0.9970045353431936,
+      "recall": 0.9971155955253346,
+      "f1-score": 0.997059717547832,
+      "support": 1716.0
     },
     "weighted avg": {
-      "precision": 0.3225541817931652,
-      "recall": 0.32340815391662847,
-      "f1-score": 0.3229733845638881,
-      "support": 2183.0
+      "precision": 0.9970872558731985,
+      "recall": 0.997086247086247,
+      "f1-score": 0.9970864098441514,
+      "support": 1716.0
     }
   },
   "confusion_matrix": [
     [
-      216,
-      744
+      774,
+      2
     ],
     [
-      733,
-      490
+      3,
+      937
     ]
   ]
 }

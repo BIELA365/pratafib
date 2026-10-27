@@ -1,0 +1,18 @@
+{
+  "architecture": "1D-DSC + TA-GRU (30s Morphology + Rhythm + SimCLR)",
+  "window_samples": 3750,
+  "sampling_rate_hz": 125,
+  "total_parameters": 40481,
+  "float32_size_kb": 394.74,
+  "int8_ptq_size_kb": 302.68,
+  "float32_benchmark": {
+    "mean_latency_ms": 6.23,
+    "p95_latency_ms": 6.721,
+    "sample_accuracy_percent": 99.5
+  },
+  "int8_ptq_benchmark": {
+    "mean_latency_ms": 6.191,
+    "p95_latency_ms": 6.733,
+    "sample_accuracy_percent": 99.5
+  }
+}
